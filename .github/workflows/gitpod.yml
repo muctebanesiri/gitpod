@@ -1,0 +1,157 @@
+name: Podcast Episode Downloader
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      rss_url:
+        description: 'RSS feed URL (overrides config)'
+        required: false
+        default: ''
+
+jobs:
+  download-podcast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 ffmpeg xmlstarlet curl unzip zip perl
+
+      - name: Set RSS feed URL
+        id: rss
+        run: |
+          if [ -n "${{ github.event.inputs.rss_url }}" ]; then
+            echo "url=${{ github.event.inputs.rss_url }}" >> $GITHUB_OUTPUT
+          else
+            # CHANGE THIS TO YOUR PODCAST RSS FEED URL
+            DEFAULT_RSS="https://feeds.megaphone.fm/example"
+            echo "url=$DEFAULT_RSS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Parse RSS and find undownloaded episodes (up to 5)
+        id: parse
+        run: |
+          RSS_URL="${{ steps.rss.outputs.url }}"
+          echo "Fetching RSS: $RSS_URL"
+          curl -s "$RSS_URL" > feed.xml
+
+          # Extract podcast title for folder name (sanitized)
+          PODCAST_TITLE=$(xmlstarlet sel -t -v "/rss/channel/title" feed.xml | \
+                          perl -CSD -pe 's/[^\p{L}\p{N}._ -]/_/g' | \
+                          sed 's/ /_/g' | \
+                          sed 's/__*/_/g' | \
+                          sed 's/^_//;s/_$//')
+          echo "Podcast folder: $PODCAST_TITLE"
+          echo "podcast_folder=$PODCAST_TITLE" >> $GITHUB_OUTPUT
+
+          # Create folder if it doesn't exist
+          mkdir -p "$PODCAST_TITLE"
+          touch "$PODCAST_TITLE/downloaded.txt"
+
+          # Extract all episodes: URL and title
+          xmlstarlet sel -t -v "//item/enclosure/@url" -n feed.xml > all_urls.txt
+          xmlstarlet sel -t -v "//item/title" -n feed.xml > all_titles.txt
+
+          # Combine, iterate from newest to oldest
+          paste all_urls.txt all_titles.txt > all_episodes.txt
+
+          > new_episodes.txt
+          count=0
+          max_to_download=5
+
+          # Sanitize function for episode titles (keeps Unicode)
+          sanitize() {
+            echo "$1" | \
+              perl -CSD -pe 's/[^\p{L}\p{N}._ -]/_/g' | \
+              sed 's/ /_/g' | \
+              sed 's/__*/_/g' | \
+              sed 's/^_//;s/_$//' | \
+              cut -c1-200
+          }
+
+          while IFS=$'\t' read -r url title && [ "$count" -lt "$max_to_download" ]; do
+            # Determine file extension from URL (e.g., .mp3, .m4a, .mp4)
+            ext=$(echo "$url" | sed -n 's/.*\.\([a-zA-Z0-9]\+\)$/\1/p' | tr '[:upper:]' '[:lower:]')
+            [ -z "$ext" ] && ext="mp3"
+            base_filename=$(sanitize "$title")
+            filename="${base_filename}.${ext}"
+
+            # Check if already downloaded
+            if ! grep -Fxq "$filename" "$PODCAST_TITLE/downloaded.txt" 2>/dev/null; then
+              echo "$url|$title|$filename" >> new_episodes.txt
+              count=$((count+1))
+            fi
+          done < all_episodes.txt
+
+          echo "count=$count" >> $GITHUB_OUTPUT
+          if [ "$count" -gt 0 ]; then
+            echo "has_new=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_new=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download new episodes (named by episode title)
+        if: steps.parse.outputs.has_new == 'true'
+        run: |
+          PODCAST_FOLDER="${{ steps.parse.outputs.podcast_folder }}"
+          mkdir -p tmp
+          while IFS='|' read -r url title filename; do
+            echo "⬇️ Downloading: $title -> $filename"
+            aria2c -x 4 -s 4 -d tmp --out="temp_file" "$url"
+            if [ -f "tmp/temp_file" ]; then
+              mv "tmp/temp_file" "$PODCAST_FOLDER/$filename"
+            else
+              echo "⚠️ Download failed for $title"
+            fi
+          done < new_episodes.txt
+
+          # Split any file larger than 90MB
+          for file in "$PODCAST_FOLDER"/*; do
+            [ -f "$file" ] || continue
+            size=$(stat -c%s "$file")
+            limit=$((90 * 1024 * 1024))
+            base=$(basename "$file")
+            if [ "$size" -gt "$limit" ]; then
+              echo "✂️ $base is large – splitting into 90MB zip chunks"
+              mv "$file" tmp/split_me
+              zip -s 90m -r "$PODCAST_FOLDER/${base}.zip" tmp/split_me
+              rm -f tmp/split_me
+              # Remove the unsplit original file reference
+              rm -f "$file"
+            fi
+          done
+
+          # Record downloaded files (original or .zip) – avoid duplicate .z01 etc.
+          for file in "$PODCAST_FOLDER"/*; do
+            [ -f "$file" ] || continue
+            base=$(basename "$file")
+            # Only record the main file (not zip parts)
+            if [[ ! "$base" =~ \.z[0-9][0-9]$ ]]; then
+              echo "$base" >> "$PODCAST_FOLDER/downloaded.txt"
+            fi
+          done
+
+          # Ensure unique entries in downloaded.txt
+          sort -u -o "$PODCAST_FOLDER/downloaded.txt" "$PODCAST_FOLDER/downloaded.txt"
+          rm -rf tmp
+
+      - name: Commit and push
+        if: steps.parse.outputs.has_new == 'true'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          PODCAST_FOLDER="${{ steps.parse.outputs.podcast_folder }}"
+          git add "$PODCAST_FOLDER"
+          git commit -m "Add new episodes of $PODCAST_FOLDER (${{ steps.parse.outputs.count }} items) [skip ci]" || echo "Nothing to commit"
+          git pull --rebase origin ${{ github.ref_name }} --autostash || true
+          git push origin HEAD:${{ github.ref_name }}
