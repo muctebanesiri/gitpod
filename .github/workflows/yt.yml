@@ -18,7 +18,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg, SoX, and Python dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg sox
@@ -30,36 +30,43 @@ jobs:
 
       - name: Install DeepFilterNet
         run: |
-          pip install deepfilternet
-          echo "DeepFilterNet installed."
+          pip install --user deepfilternet
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Process All Audio Files
+      - name: Process Audio Files
         run: |
           mkdir -p output
-          # List of supported extensions
           for ext in mp3 m4a wav flac ogg aac; do
             for file in uploads/*.$ext; do
-              # Skip if no files match
+              # Skip if no matching files
               [ -e "$file" ] || continue
               
               BASENAME=$(basename "$file" .$ext)
-              echo "Processing: $file (format: $ext)"
+              echo "=========================================="
+              echo "Processing: $file"
+              echo "Format: $ext | Base name: $BASENAME"
+              echo "=========================================="
 
-              # Step 1: Convert any input to 16kHz WAV (DeepFilterNet requirement)
-              ffmpeg -i "$file" -acodec pcm_s16le -ar 16000 "temp_${BASENAME}.wav" -y
+              # Step 1: Convert to 16kHz mono WAV (required by DeepFilterNet)
+              ffmpeg -i "$file" -acodec pcm_s16le -ar 16000 -ac 1 "temp_${BASENAME}.wav" -y
 
-              # Step 2: Denoise using DeepFilterNet
+              # Step 2: Denoise with DeepFilterNet
+              # The command is "deep-filter" (with a hyphen)
               deep-filter "temp_${BASENAME}.wav" "denoised_${BASENAME}.wav"
 
-              # Step 3: Normalize volume with SoX
+              # Step 3: Normalize volume with SoX (gain to -3 dB)
               sox "denoised_${BASENAME}.wav" "normalized_${BASENAME}.wav" gain -n -3
 
-              # Step 4: Convert final audio to MP3 (192kbps)
+              # Step 4: Convert final audio to high-quality MP3 (192kbps)
               ffmpeg -i "normalized_${BASENAME}.wav" -codec:a libmp3lame -b:a 192k "output/${BASENAME}_enhanced.mp3" -y
 
-              echo "Finished: $BASENAME → output/${BASENAME}_enhanced.mp3"
+              echo "✅ Finished: output/${BASENAME}_enhanced.mp3"
+              echo ""
             done
           done
+
+      - name: List Output Files (for debugging)
+        run: ls -lh output/
 
       - name: Upload Enhanced Audio
         uses: actions/upload-artifact@v4
