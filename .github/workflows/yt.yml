@@ -1,137 +1,56 @@
-name: Download from Commit & Save to Repo
+name: Podcast Audio Enhancement Pipeline
+
 on:
   push:
-    branches:
-      - "**"
-jobs:
-  save-file:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+    paths:
+      - 'uploads/*.mp3'
 
-      - name: Install dependencies
+jobs:
+  enhance-episode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg and SoX
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 python3 python3-pip python3-requests ffmpeg curl pigz zstd
-          pip3 install "yt-dlp[default]"
+          sudo apt-get install -y ffmpeg sox
 
-      - name: Install bun
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install DeepFilterNet
         run: |
-          curl -fsSL https://bun.com/install | bash
-          echo "$HOME/.bun/bin" >> $GITHUB_PATH
-          echo "BUN_INSTALL_DIR=$HOME/.bun" >> $GITHUB_ENV
+          pip install deepfilternet
+          echo "DeepFilterNet Noise Reduction Model Installed."
 
-      - name: Setup YouTube cookies
-        if: success()
+      - name: Process Audio
         run: |
-          echo '${{ secrets.YOUTUBE_COOKIES }}' > youtube_cookies.txt
-        env:
-          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          echo "Starting Audio Processing Workflow..."
+          for file in uploads/*.mp3; do
+            BASENAME=$(basename "$file" .mp3)
+            echo "Processing: $file"
 
-      - name: Setup scripts
-        run: |
-          mkdir -p scripts
-          cp -r ${{ github.server_url }}/${{ github.repository }}/scripts scripts/ || true
+            # Step 1: Convert MP3 to WAV
+            ffmpeg -i "$file" -acodec pcm_s16le -ar 16000 "temp_${BASENAME}.wav" -y
 
-      - name: Extract URLs and download files
-        shell: bash
-        run: |
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
+            # Step 2: Denoise using DeepFilterNet
+            deep-filter "temp_${BASENAME}.wav" "denoised_${BASENAME}.wav"
 
-          if echo "$MSG" | grep -qP 'download-zip:'; then
-            MODE="zip"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
-          elif echo "$MSG" | grep -qP 'download:'; then
-            MODE="normal"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
-          else
-            echo "❌ No download command found in commit message"
-            exit 1
-          fi
+            # Step 3: Normalize Audio Volume
+            sox "denoised_${BASENAME}.wav" "normalized_${BASENAME}.wav" gain -n -3
 
-          echo "Mode: $MODE"
-          mkdir -p downloads tmp_downloads
+            # Step 4: Convert final audio back to MP3
+            ffmpeg -i "normalized_${BASENAME}.wav" -codec:a libmp3lame -b:a 192k "output/${BASENAME}_enhanced.mp3" -y
 
-          for URL in $URL_LINE; do
-            echo "Processing: $URL"
-
-            if echo "$URL" | grep -qE "(bunkr\.si|bunkr\.fi|bunkr\.ru|bunkr\.cr|bunkr\.rip|bunkrr\.su)"; then
-              echo "Downloading Bunkr: $URL"
-              python3 scripts/bunkr.py "$URL" "tmp_downloads"
-
-            elif echo "$URL" | grep -qE "(youtube\.com|youtu\.be|twitch\.tv|reddit\.com|ni长沙|pexels|soundcloud)"; then
-              echo "Downloading with yt-dlp: $URL"
-              yt-dlp -q --no-warnings --js-runtimes bun:/home/runner/.bun/bin --cookies youtube_cookies.txt -o "tmp_downloads/%(title)s.%(ext)s" "$URL"
-
-            else
-              echo "Downloading with aria2: $URL"
-              aria2c \
-                --split=2 \
-                --max-connection-per-server=2 \
-                --min-split-size=90M \
-                --summary-interval=2 \
-                --dir="tmp_downloads" \
-                "$URL"
-            fi
+            echo "Finished Processing: $BASENAME"
           done
 
-          if [ "$MODE" = "zip" ]; then
-              ARCHIVE_NAME="tmp_downloads/archive_$(date +%Y%m%d_%H%M%S).tar.gz"
-              tar -cvf - -C tmp_downloads . | pigz -k -p all > "$ARCHIVE_NAME"
-            fi
-
-          for FILE in tmp_downloads/*; do
-            [ -f "$FILE" ] || continue
-            SIZE=$(stat -c%s "$FILE")
-            LIMIT=$((90 * 1024 * 1024))
-            BASENAME=$(basename "$FILE")
-
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "Splitting: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
-              split -b 90M "$FILE" "downloads/${BASENAME}.part_"
-              echo "Parts: $(ls "downloads/${BASENAME}.part_"* 2>/dev/null | wc -l)"
-            else
-              cp "$FILE" "downloads/$BASENAME"
-            fi
-          done
-
-          rm -rf tmp_downloads
-
-      - name: Commit & Push in batches
-        run: |
-          BRANCH="${GITHUB_REF_NAME}"
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          cd downloads
-
-          FILE_COUNT=$(find . -type f | wc -l)
-          echo "Total files to push: $FILE_COUNT"
-
-          BATCH_SIZE=10
-          BATCH_NUM=0
-          CURRENT_BATCH=1
-          TOTAL_BATCHES=$(((FILE_COUNT + BATCH_SIZE - 1) / BATCH_SIZE))
-
-          > /tmp/batch_files.txt
-
-          find . -type f -print0 | sort -z | while IFS= read -r -d '' FILE; do
-            BATCH_NUM=$((BATCH_NUM + 1))
-            printf '%s\0' "$FILE" >> /tmp/batch_files.txt
-
-            if [ $((BATCH_NUM % BATCH_SIZE)) -eq 0 ] || [ $BATCH_NUM -eq "$FILE_COUNT" ]; then
-              xargs -0 git add -f < /tmp/batch_files.txt
-              git commit -m "Add downloaded files (batch $CURRENT_BATCH/$TOTAL_BATCHES) [skip ci]" || echo "Nothing to commit"
-              echo "🚀 Pushing batch $CURRENT_BATCH/$TOTAL_BATCHES..."
-              git push origin HEAD:$BRANCH || true
-
-              CURRENT_BATCH=$((CURRENT_BATCH + 1))
-              > /tmp/batch_files.txt
-            fi
-          done
+      - name: Upload Enhanced Audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: enhanced-episodes
+          path: output/
