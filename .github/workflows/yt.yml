@@ -1,4 +1,4 @@
-name: Podcast Audio Enhancement Pipeline
+name: Podcast Audio Enhancement Pipeline (Commit to Repo)
 
 on:
   push:
@@ -9,14 +9,20 @@ on:
       - 'uploads/*.flac'
       - 'uploads/*.ogg'
       - 'uploads/*.aac'
-  workflow_dispatch:  # allows manual trigger
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   enhance-episode:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to push commits back
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for push
 
       - name: Install System Dependencies
         run: |
@@ -34,42 +40,34 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Process Audio Files
+        id: process
         run: |
-          mkdir -p output
+          mkdir -p enhanced
+          processed_files=""
           for ext in mp3 m4a wav flac ogg aac; do
             for file in uploads/*.$ext; do
-              # Skip if no matching files
               [ -e "$file" ] || continue
-              
               BASENAME=$(basename "$file" .$ext)
-              echo "=========================================="
               echo "Processing: $file"
-              echo "Format: $ext | Base name: $BASENAME"
-              echo "=========================================="
-
-              # Step 1: Convert to 16kHz mono WAV (required by DeepFilterNet)
               ffmpeg -i "$file" -acodec pcm_s16le -ar 16000 -ac 1 "temp_${BASENAME}.wav" -y
-
-              # Step 2: Denoise with DeepFilterNet
-              # The command is "deep-filter" (with a hyphen)
               deep-filter "temp_${BASENAME}.wav" "denoised_${BASENAME}.wav"
-
-              # Step 3: Normalize volume with SoX (gain to -3 dB)
               sox "denoised_${BASENAME}.wav" "normalized_${BASENAME}.wav" gain -n -3
-
-              # Step 4: Convert final audio to high-quality MP3 (192kbps)
-              ffmpeg -i "normalized_${BASENAME}.wav" -codec:a libmp3lame -b:a 192k "output/${BASENAME}_enhanced.mp3" -y
-
-              echo "✅ Finished: output/${BASENAME}_enhanced.mp3"
-              echo ""
+              ffmpeg -i "normalized_${BASENAME}.wav" -codec:a libmp3lame -b:a 192k "enhanced/${BASENAME}_enhanced.mp3" -y
+              processed_files="$processed_files ${BASENAME}"
             done
           done
+          # Set output for later step
+          echo "processed=${processed_files}" >> $GITHUB_OUTPUT
 
-      - name: List Output Files (for debugging)
-        run: ls -lh output/
+      - name: Commit and Push Enhanced Audio
+        if: steps.process.outputs.processed != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add enhanced/
+          # Only commit if there are changes
+          git diff --staged --quiet || git commit -m "Add enhanced audio files [skip ci]"
+          git push
 
-      - name: Upload Enhanced Audio
-        uses: actions/upload-artifact@v4
-        with:
-          name: enhanced-episodes
-          path: output/
+      - name: Cleanup temporary files
+        run: rm -f temp_*.wav denoised_*.wav normalized_*.wav
