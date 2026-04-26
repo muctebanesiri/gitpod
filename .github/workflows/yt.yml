@@ -17,12 +17,12 @@ jobs:
   enhance-episode:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # needed to push commits back
+      contents: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history for push
+          fetch-depth: 0
 
       - name: Install System Dependencies
         run: |
@@ -36,8 +36,7 @@ jobs:
 
       - name: Install DeepFilterNet
         run: |
-          pip install --user deepfilternet
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          pip install deepfilternet
 
       - name: Process Audio Files
         id: process
@@ -50,13 +49,13 @@ jobs:
               BASENAME=$(basename "$file" .$ext)
               echo "Processing: $file"
               ffmpeg -i "$file" -acodec pcm_s16le -ar 16000 -ac 1 "temp_${BASENAME}.wav" -y
-              deep-filter "temp_${BASENAME}.wav" "denoised_${BASENAME}.wav"
+              # Use python module directly (no PATH issues)
+              python -m deepfilternet "temp_${BASENAME}.wav" "denoised_${BASENAME}.wav"
               sox "denoised_${BASENAME}.wav" "normalized_${BASENAME}.wav" gain -n -3
               ffmpeg -i "normalized_${BASENAME}.wav" -codec:a libmp3lame -b:a 192k "enhanced/${BASENAME}_enhanced.mp3" -y
               processed_files="$processed_files ${BASENAME}"
             done
           done
-          # Set output for later step
           echo "processed=${processed_files}" >> $GITHUB_OUTPUT
 
       - name: Commit and Push Enhanced Audio
@@ -65,7 +64,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add enhanced/
-          # Only commit if there are changes
           git diff --staged --quiet || git commit -m "Add enhanced audio files [skip ci]"
           git push
 
