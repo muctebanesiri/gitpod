@@ -1,20 +1,16 @@
-name: Podcast Audio Enhancement Pipeline
+name: Podcast Audio Enhancer (Bulletproof)
 
 on:
   push:
     paths:
       - 'uploads/*.mp3'
       - 'uploads/*.m4a'
-      - 'uploads/*.wav'
-      - 'uploads/*.flac'
-      - 'uploads/*.ogg'
-      - 'uploads/*.aac'
     branches:
       - main
   workflow_dispatch:
 
 jobs:
-  enhance:
+  enhance-podcast:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -25,60 +21,49 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies (FFmpeg & SoX)
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg sox
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install DeepFilterNet and verify
-        run: |
-          python -m pip install --upgrade pip
-          pip install deepfilternet
-          # Verify the module is importable
-          python -c "import deepfilternet; print('DeepFilterNet OK')"
 
       - name: Process audio files
         id: process
         run: |
           mkdir -p enhanced
-          processed=""
-          for ext in mp3 m4a wav flac ogg aac; do
-            for file in uploads/*.$ext; do
-              [ -e "$file" ] || continue
-              base=$(basename "$file" .$ext)
-              echo "Processing: $file"
-              
-              # Convert to 16kHz mono WAV
-              ffmpeg -i "$file" -acodec pcm_s16le -ar 16000 -ac 1 "temp_${base}.wav" -y
-              
-              # Denoise using DeepFilterNet (Python module)
-              python -m deepfilternet "temp_${base}.wav" "denoised_${base}.wav"
-              
-              # Normalize volume to -3 dB
-              sox "denoised_${base}.wav" "normalized_${base}.wav" gain -n -3
-              
-              # Encode to high-quality MP3
-              ffmpeg -i "normalized_${base}.wav" -codec:a libmp3lame -b:a 192k "enhanced/${base}_enhanced.mp3" -y
-              
-              processed="$processed $base"
-            done
-          done
-          echo "processed=${processed}" >> $GITHUB_OUTPUT
+          processed_files=""
+          for file in uploads/*.mp3 uploads/*.m4a; do
+            [ -e "$file" ] || continue
+            base=$(basename "$file" .${file##*.})
+            echo "Processing: $file"
 
-      - name: Commit and push enhanced audio
+            # 1. Convert input to 48kHz WAV (arnndn needs 48kHz)
+            ffmpeg -i "$file" -acodec pcm_s16le -ar 48000 -ac 1 "temp_${base}.wav" -y
+
+            # 2. Apply cascading noise reduction filters
+            #    afftdn: general broadband noise reduction
+            #    anlmdn: non-local means denoiser for transient noise
+            #    arnndn: RNNoise-based filter for hiss/hum reduction
+            ffmpeg -i "temp_${base}.wav" -af "afftdn=nf=-25,anlmdn,silenceremove=1:0:-50dB,arnndn=m=./rnnoise-models/rnnoise-model.2023.1.1.nn,volume=2dB" "denoised_${base}.wav" -y
+
+            # 3. Normalize loudness to broadcast standard (EBU R128)
+            ffmpeg -i "denoised_${base}.wav" -af loudnorm=I=-16:LRA=11:TP=-1.5 "normalized_${base}.wav" -y
+
+            # 4. Encode to high-quality MP3
+            ffmpeg -i "normalized_${base}.wav" -codec:a libmp3lame -b:a 192k "enhanced/${base}_enhanced.mp3" -y
+
+            processed_files="$processed_files $base"
+          done
+          echo "processed=${processed_files}" >> $GITHUB_OUTPUT
+
+      - name: Commit and push
         if: steps.process.outputs.processed != ''
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add enhanced/
-          git diff --staged --quiet || git commit -m "Add enhanced audio [skip ci]"
+          git diff --staged --quiet || git commit -m "Add enhanced podcast audio [skip ci]"
           git push
 
-      - name: Cleanup temporary files
+      - name: Cleanup
         if: always()
         run: rm -f temp_*.wav denoised_*.wav normalized_*.wav
